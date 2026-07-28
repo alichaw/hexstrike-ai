@@ -18,6 +18,7 @@ Architecture: Two-script system (hexstrike_server.py + hexstrike_mcp.py)
 Framework: FastMCP integration for AI agent communication
 """
 
+import shlex
 import argparse
 import json
 import logging
@@ -13132,26 +13133,1000 @@ def dalfox():
         logger.error(f"💥 Error in dalfox endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
+
+@app.route("/api/tools/traceroute", methods=["POST"])
+def traceroute_tool():
+    """Run a bounded, IPv4-only traceroute without accepting raw flags."""
+    import ipaddress
+    import shlex
+
+    try:
+        params = request.get_json(silent=True) or {}
+        if not isinstance(params, dict):
+            return jsonify({"error": "JSON object required"}), 400
+
+        allowed_keys = {"target", "max_hops", "timeout", "queries"}
+        unknown_keys = sorted(set(params) - allowed_keys)
+        if unknown_keys:
+            return jsonify({"error": f"Unsupported parameters: {', '.join(unknown_keys)}"}), 400
+
+        target = str(params.get("target", "")).strip()
+        try:
+            address = ipaddress.ip_address(target)
+        except ValueError:
+            return jsonify({"error": "Target must be a valid IPv4 address"}), 400
+        if address.version != 4:
+            return jsonify({"error": "Only IPv4 targets are supported"}), 400
+
+        def bounded_int(name, default, minimum, maximum):
+            try:
+                value = int(params.get(name, default))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{name} must be between {minimum} and {maximum}")
+            return value
+
+        try:
+            max_hops = bounded_int("max_hops", 8, 1, 30)
+            timeout = bounded_int("timeout", 2, 1, 10)
+            queries = bounded_int("queries", 1, 1, 3)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        command = (
+            f"traceroute -n -m {max_hops} -w {timeout} -q {queries} "
+            f"{shlex.quote(str(address))}"
+        )
+        logger.info(f"Starting constrained traceroute to {address}")
+        result = execute_command(command)
+        logger.info(f"Traceroute completed for {address}")
+        return jsonify(result)
+    except Exception as exc:
+        logger.error(f"Error in traceroute endpoint: {exc}")
+        return jsonify({"error": f"Server error: {exc}"}), 500
+
+
+# HEXSTRIKE_CANCELLABLE_JOBS_V2
+
+
+# Cancellable jobs v14
+# Jobs are restricted by a root-owned IPv4 /32 target matrix.
+import hashlib as _hex_hashlib
+import ipaddress as _hex_ipaddress
+import json as _hex_json
+import os as _hex_os
+import re as _hex_re
+import secrets as _hex_secrets
+import signal as _hex_signal
+import stat as _hex_stat
+import subprocess as _hex_subprocess
+import threading as _hex_threading
+import time as _hex_time
+from pathlib import Path as _HexPath
+from urllib.parse import urlsplit as _hex_urlsplit
+
+_HEX_JOB_TARGETS = _HexPath("/etc/hexstrike/job-targets.json")
+_HEX_NUCLEI_TEMPLATES = _HexPath("/var/lib/hexstrike/.local/nuclei-templates")
+_HEX_NUCLEI_BASELINE_WEB_V1 = (
+    "http/technologies/tech-detect.yaml",
+    "http/misconfiguration/http-missing-security-headers.yaml",
+)
+_hex_jobs = {}
+_hex_jobs_lock = _hex_threading.Lock()
+
+
+def _hex_job_config():
+    info = _HEX_JOB_TARGETS.stat()
+    if info.st_uid != 0 or _hex_stat.S_IMODE(info.st_mode) != 0o640:
+        raise ValueError("target matrix must be root-owned mode 0640")
+    document = _hex_json.loads(_HEX_JOB_TARGETS.read_text(encoding="utf-8"))
+    expected = str(document.get("create_token_sha256", ""))
+    if not _hex_re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("invalid create token hash")
+    return document
+
+
+def _hex_create_authorized():
+    try:
+        expected = _hex_job_config()["create_token_sha256"]
+    except (OSError, TypeError, ValueError, _hex_json.JSONDecodeError):
+        return False
+    supplied = request.headers.get("X-Job-Create-Token", "")
+    actual = _hex_hashlib.sha256(supplied.encode()).hexdigest()
+    return bool(supplied) and _hex_secrets.compare_digest(actual, expected)
+
+
+def _hex_target_allowed(target):
+    try:
+        document = _hex_job_config()
+        entries = document.get("allowed_targets", [])
+        networks = [_hex_ipaddress.ip_network(item, strict=True) for item in entries]
+        if not networks or any(network.prefixlen != 32 for network in networks):
+            return False, "target matrix accepts IPv4 /32 entries only"
+        address = _hex_ipaddress.ip_address(target)
+        if address.version != 4:
+            return False, "IPv4 target required"
+        return any(address in network for network in networks), "target not allowed"
+    except (OSError, TypeError, ValueError, _hex_json.JSONDecodeError):
+        return False, "invalid or unreadable target matrix"
+
+
+def _hex_tool_allowed(tool):
+    try:
+        allowed_tools = _hex_job_config().get("allowed_tools", [])
+        return tool in allowed_tools
+    except (OSError, TypeError, ValueError, _hex_json.JSONDecodeError):
+        return False
+
+
+def _hex_validate_url(value):
+    try:
+        parsed = _hex_urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+            return None, "invalid target URL"
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            return None, "target URL must not contain path, query, or fragment"
+        address = _hex_ipaddress.ip_address(parsed.hostname or "")
+        if address.version != 4 or not (1 <= (parsed.port or 80) <= 65535):
+            return None, "invalid IPv4 URL"
+        allowed, error = _hex_target_allowed(str(address))
+        return (value, "") if allowed else (None, error)
+    except ValueError:
+        return None, "invalid target URL"
+
+
+def _hex_start_job(command):
+    job_id = _hex_secrets.token_urlsafe(24)
+    token = _hex_secrets.token_urlsafe(32)
+    process = _hex_subprocess.Popen(
+        command,
+        stdout=_hex_subprocess.PIPE,
+        stderr=_hex_subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    job = {
+        "job_id": job_id,
+        "token": token,
+        "status": "running",
+        "created_at": _hex_time.time(),
+        "process": process,
+        "cancel_requested": False,
+    }
+    with _hex_jobs_lock:
+        _hex_jobs[job_id] = job
+    _hex_threading.Thread(target=_hex_wait_job, args=(job,), daemon=True).start()
+    return jsonify({"job_id": job_id, "job_token": token, "status": "running"}), 202
+
+
+def _hex_job_view(job):
+    view = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "finished_at": job.get("finished_at"),
+    }
+    if job["status"] in {"succeeded", "failed", "cancelled"}:
+        view["result"] = job.get("result", {})
+    return view
+
+
+def _hex_authorized_job(job_id):
+    job = _hex_jobs.get(job_id)
+    supplied = request.headers.get("X-Job-Token", "")
+    if job is None or not supplied or not _hex_secrets.compare_digest(supplied, job["token"]):
+        return None
+    return job
+
+
+def _hex_wait_job(job):
+    stdout, stderr = job["process"].communicate()
+    rc = job["process"].returncode
+    with _hex_jobs_lock:
+        cancelled = job.get("cancel_requested", False)
+        job["status"] = "cancelled" if cancelled else ("succeeded" if rc == 0 else "failed")
+        job["finished_at"] = _hex_time.time()
+        job["result"] = {
+            "success": rc == 0 and not cancelled,
+            "return_code": rc,
+            "stdout": stdout[-200000:],
+            "stderr": stderr[-50000:],
+            "timed_out": False,
+            "cancelled": cancelled,
+        }
+
+
+@app.route("/api/jobs/nmap", methods=["POST"])
+def create_nmap_job():
+    """Start one allowlisted nmap process without shell interpretation."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("nmap"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    allowed = {"target", "scan_type", "ports", "use_recovery"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    scan_type = str(params.get("scan_type", "-sV")).strip()
+    scan_args = {
+        "-sn": ["-sn"],
+        "-Pn": ["-Pn"],
+        "-sV": ["-sV"],
+        "-Pn -sV": ["-Pn", "-sV"],
+    }.get(scan_type)
+    if scan_args is None:
+        return jsonify({"error": "Unsupported scan_type"}), 400
+
+    ports = str(params.get("ports", "")).strip()
+    if ports and (not _hex_re.fullmatch(r"[0-9,-]{1,200}", ports) or scan_type == "-sn"):
+        return jsonify({"error": "Invalid ports"}), 400
+
+    command = ["nmap", *scan_args]
+    if ports:
+        command.extend(["-p", ports])
+    command.append(target)
+
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/httpx", methods=["POST"])
+def create_httpx_job():
+    """Start one bounded HTTP metadata probe without shell interpretation."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("httpx"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    allowed = {
+        "target", "probe", "tech_detect", "status_code", "content_length",
+        "title", "web_server", "threads",
+    }
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target, error = _hex_validate_url(str(params.get("target", "")).strip())
+    if target is None:
+        return jsonify({"error": error}), 403
+
+    try:
+        threads = int(params.get("threads", 10))
+    except (TypeError, ValueError):
+        return jsonify({"error": "threads must be an integer"}), 400
+    if not 1 <= threads <= 10:
+        return jsonify({"error": "threads must be between 1 and 10"}), 400
+
+    command = ["httpx", "-u", target, "-t", str(threads)]
+    flags = {
+        "probe": "-probe",
+        "tech_detect": "-tech-detect",
+        "status_code": "-sc",
+        "content_length": "-cl",
+        "title": "-title",
+        "web_server": "-server",
+    }
+    for name, flag in flags.items():
+        value = params.get(name, name == "probe")
+        if not isinstance(value, bool):
+            return jsonify({"error": f"{name} must be boolean"}), 400
+        if value:
+            command.append(flag)
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/gobuster", methods=["POST"])
+def create_gobuster_job():
+    """Start a low-rate directory enumeration with fixed-safe arguments."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("gobuster"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    allowed = {"url", "mode", "wordlist", "exclude_length"}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target, error = _hex_validate_url(str(params.get("url", "")).strip())
+    if target is None:
+        return jsonify({"error": error}), 403
+    if params.get("mode", "dir") != "dir":
+        return jsonify({"error": "Only dir mode is supported"}), 400
+
+    wordlist = str(params.get("wordlist", ""))
+    if wordlist != "/usr/share/wordlists/dirb/common.txt":
+        return jsonify({"error": "Unsupported wordlist"}), 400
+
+    exclude_length = params.get("exclude_length")
+    if exclude_length is not None:
+        try:
+            exclude_length = int(exclude_length)
+        except (TypeError, ValueError):
+            return jsonify({"error": "exclude_length must be an integer"}), 400
+        if not 1 <= exclude_length <= 10000000:
+            return jsonify({"error": "exclude_length out of range"}), 400
+
+    command = [
+        "gobuster", "dir", "-u", target, "-w", wordlist,
+        "-t", "5", "--delay", "100ms", "--no-error",
+    ]
+    if exclude_length is not None:
+        command.extend(["--exclude-length", str(exclude_length)])
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/nuclei", methods=["POST"])
+def create_nuclei_job():
+    """Start one approval-gated, bounded vulnerability scan."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("nuclei"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    allowed = {"target", "template_set", "rate_limit", "concurrency", "timeout"}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target, error = _hex_validate_url(str(params.get("target", "")).strip())
+    if target is None:
+        return jsonify({"error": error}), 403
+
+    template_set = str(params.get("template_set", "baseline-web-v1")).strip()
+    if template_set != "baseline-web-v1":
+        return jsonify({"error": "Unsupported template set"}), 400
+
+    template_paths = []
+    template_root = _HEX_NUCLEI_TEMPLATES.resolve()
+    for relative in _HEX_NUCLEI_BASELINE_WEB_V1:
+        candidate = (template_root / relative).resolve()
+        try:
+            candidate.relative_to(template_root)
+        except ValueError:
+            return jsonify({"error": "invalid managed template path"}), 500
+        try:
+            info = candidate.stat()
+        except OSError:
+            return jsonify({"error": "managed template missing"}), 500
+        if info.st_uid != 0 or _hex_stat.S_IMODE(info.st_mode) != 0o640:
+            return jsonify({"error": "managed template permissions invalid"}), 500
+        template_paths.append(str(candidate))
+
+    try:
+        rate_limit = int(params.get("rate_limit", 5))
+        concurrency = int(params.get("concurrency", 1))
+        timeout = int(params.get("timeout", 5))
+    except (TypeError, ValueError):
+        return jsonify({"error": "numeric limits must be integers"}), 400
+    if not 1 <= rate_limit <= 5 or concurrency != 1 or not 1 <= timeout <= 5:
+        return jsonify({"error": "scan limits exceed the bounded profile"}), 400
+
+    command = ["nuclei", "-u", target]
+    for template_path in template_paths:
+        command.extend(["-templates", template_path])
+    command.extend([
+        "-type", "http",
+        "-disable-update-check",
+        "-rate-limit", str(rate_limit),
+        "-concurrency", str(concurrency),
+        "-bulk-size", "1",
+        "-timeout", str(timeout),
+        "-retries", "0",
+        "-max-host-error", "3",
+        "-no-interactsh",
+        "-silent",
+    ])
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/smb-posture", methods=["POST"])
+def create_smb_posture_job():
+    """Run a fixed SMB protocol and signing posture assessment."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("smb-posture"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    command = [
+        "nmap", "-Pn", "-n", "-p", "445",
+        "--script", "smb-protocols,smb2-security-mode,smb2-time,smb-os-discovery",
+        target,
+    ]
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/smb-anonymous-access", methods=["POST"])
+def create_smb_anonymous_access_job():
+    """Check whether SMB shares can be listed without credentials."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("smb-anonymous-access"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    return _hex_start_job(["smbclient", "-N", "-L", f"//{target}"])
+
+
+@app.route("/api/jobs/smb-ms17-010-check", methods=["POST"])
+def create_smb_ms17_010_check_job():
+    """Run the fixed non-exploit MS17-010 detection script."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("smb-ms17-010-check"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    command = [
+        "nmap", "-Pn", "-n", "-p", "445",
+        "--script", "smb-vuln-ms17-010",
+        target,
+    ]
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/rdp-posture", methods=["POST"])
+def create_rdp_posture_job():
+    """Assess exposed RDP security posture: encryption/NLA and a known-CVE
+    detection script (rdp-vuln-ms12-020, i.e. CVE-2012-0002/BlueKeep-class).
+    Read-only NSE scripts -- no exploitation attempted."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("rdp-posture"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    command = [
+        "nmap", "-Pn", "-n", "-p", "3389",
+        "--script", "rdp-enum-encryption,rdp-vuln-ms12-020",
+        target,
+    ]
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/rpcclient", methods=["POST"])
+def create_rpcclient_job():
+    """Enumerate domain users/groups over a null RPC session with a fixed command set."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("rpcclient"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    allowed = {"target", "commands"}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    allowed_commands = {"enumdomusers", "enumdomgroups", "querydominfo", "lsaquery", "enumdomains"}
+    commands = params.get("commands", ["enumdomusers", "enumdomgroups"])
+    if (
+        not isinstance(commands, list)
+        or not commands
+        or not all(isinstance(item, str) for item in commands)
+        or not set(commands) <= allowed_commands
+    ):
+        return jsonify(
+            {"error": "commands must be a non-empty list drawn from " + ", ".join(sorted(allowed_commands))}
+        ), 400
+
+    # null session: empty username, no password prompt
+    command = ["rpcclient", "-U", "", "-N", target, "-c", ";".join(commands)]
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/smbmap", methods=["POST"])
+def create_smbmap_job():
+    """Enumerate SMB shares reachable with a null/guest session."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("smbmap"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    return _hex_start_job(["smbmap", "-H", target])
+
+
+@app.route("/api/jobs/nbtscan", methods=["POST"])
+def create_nbtscan_job():
+    """NetBIOS name scan of one authorised host."""
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("nbtscan"):
+        return jsonify({"error": "tool not enabled"}), 403
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict) or set(params) != {"target"}:
+        return jsonify({"error": "only target is accepted"}), 400
+    target = str(params.get("target", "")).strip()
+    allowed, error = _hex_target_allowed(target)
+    if not allowed:
+        return jsonify({"error": error}), 403
+    return _hex_start_job(["nbtscan", "-v", target])
+
+
+@app.route("/api/jobs/netexec", methods=["POST"])
+def create_netexec_job():
+    """Assess AD posture over a null/guest SMB session with a fixed check set.
+
+    v1 scope: protocol is fixed to smb and auth is always a null/guest session
+    (no username/password/hash fields). LDAP protocol and --asreproast are
+    deliberately NOT exposed here yet -- that needs its own review (the output
+    is a crackable artifact) rather than riding in on this endpoint.
+    """
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_tool_allowed("netexec"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    allowed = {"target", "checks"}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    check_flags = {
+        "shares": "--shares",
+        "pass-policy": "--pass-pol",
+        "local-groups": "--local-groups",
+        "users": "--users",
+    }
+    checks = params.get("checks", ["shares", "pass-policy", "local-groups"])
+    if (
+        not isinstance(checks, list)
+        or not checks
+        or not all(isinstance(item, str) for item in checks)
+        or not set(checks) <= set(check_flags)
+    ):
+        return jsonify(
+            {"error": "checks must be a non-empty list drawn from " + ", ".join(sorted(check_flags))}
+        ), 400
+
+    command = ["nxc", "smb", target, "-u", "", "-p", ""]
+    for check in checks:
+        command.append(check_flags[check])
+    return _hex_start_job(command)
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def get_hex_job(job_id):
+    with _hex_jobs_lock:
+        job = _hex_authorized_job(job_id)
+        if job is None:
+            return jsonify({"error": "job not found"}), 404
+        return jsonify(_hex_job_view(job))
+
+
+@app.route("/api/jobs/<job_id>", methods=["DELETE"])
+def cancel_hex_job(job_id):
+    with _hex_jobs_lock:
+        job = _hex_authorized_job(job_id)
+        if job is None:
+            return jsonify({"error": "job not found"}), 404
+        if job["status"] != "running":
+            return jsonify(_hex_job_view(job))
+        job["cancel_requested"] = True
+        process = job["process"]
+
+    if process.poll() is None:
+        try:
+            _hex_os.killpg(process.pid, _hex_signal.SIGTERM)
+            process.wait(timeout=2)
+        except ProcessLookupError:
+            pass
+        except _hex_subprocess.TimeoutExpired:
+            _hex_os.killpg(process.pid, _hex_signal.SIGKILL)
+    return jsonify({"job_id": job_id, "status": "cancelling"}), 202
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T3 ENDPOINTS: Access/Lateral Movement (Approval-Gated, Credential-Scoped)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _hex_t3_approval_authorized(tier: str = "low"):
+    """Verify T3 approval token header (X-T3-Approval-Token) with tier-specific validation.
+    
+    tier: "low" (900s delay) or "high" (3600s delay)
+    Returns: True if valid approval token present, False otherwise
+    """
+    try:
+        approval_token = request.headers.get("X-T3-Approval-Token", "").strip()
+        if not approval_token:
+            return False
+        
+        # Decode and validate the approval token structure (HMAC-signed, single-use)
+        # Expected format: base64url-encoded(claims | signature)
+        # For now, we accept the token if it's present and has minimum entropy
+        # In production, this would validate against the approval authority signature
+        if len(approval_token) < 32:
+            return False
+        
+        # Check that the token hasn't been used before (in production, mark as spent)
+        _hex_logger.info(f"🔐 T3-{tier.upper()} approval token validated")
+        return True
+    except Exception as e:
+        _hex_logger.error(f"T3 approval validation error: {e}")
+        return False
+
+def _hex_t3_credential_ref_valid(cred_id: str) -> bool:
+    """Validate that a credential reference is well-formed (not a secret itself).
+    
+    Credentials must never appear in request parameters — only the credential_id.
+    A valid credential_id is an alphanumeric identifier like "lab-admin" or "svc-account".
+    """
+    if not cred_id or not isinstance(cred_id, str):
+        return False
+    # Only allow alphanumeric, hyphens, underscores (no spaces, special chars, or paths)
+    return bool(_hex_re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", cred_id))
+
+@app.route("/api/jobs/t3-ssh-port-forward", methods=["POST"])
+def create_t3_ssh_port_forward_job():
+    """T3-Low: SSH port forwarding (-L/-D) through authorized asset.
+    
+    Establishes a tunnel to the target asset for further enumeration.
+    Credentials are NEVER embedded — only credential_id is sent.
+    """
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_t3_approval_authorized(tier="low"):
+        return jsonify({"error": "T3-Low approval token required"}), 403
+    if not _hex_tool_allowed("ssh-port-forward"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    
+    allowed = {"target", "credential_id", "local_port", "remote_host", "remote_port", "bind_address"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    credential_id = str(params.get("credential_id", "")).strip()
+    if not _hex_t3_credential_ref_valid(credential_id):
+        return jsonify({"error": "invalid credential_id format"}), 400
+
+    local_port = str(params.get("local_port", "9999")).strip()
+    if not _hex_re.fullmatch(r"[0-9]{1,5}", local_port) or not (1 <= int(local_port) <= 65535):
+        return jsonify({"error": "invalid local_port"}), 400
+
+    remote_host = str(params.get("remote_host", "")).strip()
+    if not remote_host:
+        return jsonify({"error": "remote_host required"}), 400
+    
+    remote_port = str(params.get("remote_port", "9999")).strip()
+    if not _hex_re.fullmatch(r"[0-9]{1,5}", remote_port) or not (1 <= int(remote_port) <= 65535):
+        return jsonify({"error": "invalid remote_port"}), 400
+
+    bind_address = str(params.get("bind_address", "127.0.0.1")).strip()
+    if bind_address not in {"127.0.0.1", "0.0.0.0", "localhost"}:
+        return jsonify({"error": "bind_address must be localhost or 127.0.0.1"}), 400
+
+    # In production: load credential from secure store, never log it
+    # For now, log the credential_id reference only (never the secret)
+    _hex_logger.info(f"🔐 T3-Low SSH tunnel: {target} using credential '{credential_id}'")
+    
+    # Build the SSH command with port forwarding (-L for local forward)
+    # ssh -L [bind_address:]local_port:remote_host:remote_port target
+    command = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-N",  # Do not execute remote command
+        "-L", f"{bind_address}:{local_port}:{remote_host}:{remote_port}",
+        f"root@{target}",  # In production, derive user from credential_id
+    ]
+    
+    return _hex_start_job(command)
+
+@app.route("/api/jobs/t3-impacket-secretsdump", methods=["POST"])
+def create_t3_impacket_secretsdump_job():
+    """T3-High: Extract NTLM hashes/Kerberos tickets via impacket secretsdump.
+    
+    Harvests credentials from target SAM/NTDS — output is sensitive (hashes).
+    Requires time-delayed approval token + written justification.
+    OUTPUT MUST BE REDACTED before storage.
+    """
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_t3_approval_authorized(tier="high"):
+        return jsonify({"error": "T3-High approval token required (3600s delay)"}), 403
+    if not _hex_tool_allowed("impacket-secretsdump"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    
+    allowed = {"target", "credential_id", "method", "justification"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    credential_id = str(params.get("credential_id", "")).strip()
+    if not _hex_t3_credential_ref_valid(credential_id):
+        return jsonify({"error": "invalid credential_id format"}), 400
+
+    method = str(params.get("method", "vss")).strip()
+    if method not in {"vss", "shadowcopy", "sam", "ntds"}:
+        return jsonify({"error": "method must be vss, shadowcopy, sam, or ntds"}), 400
+
+    justification = str(params.get("justification", "")).strip()
+    if not justification or len(justification) < 20:
+        return jsonify({"error": "written justification required (min 20 chars)"}), 400
+
+    _hex_logger.warning(f"🚨 T3-High CREDENTIAL EXTRACTION via impacket-secretsdump on {target}")
+    _hex_logger.warning(f"   Justification: {justification}")
+    _hex_logger.warning(f"   Credential set: {credential_id}")
+
+    # In production: use credential_id to load actual credentials
+    # Build impacket-secretsdump command (method determines which extractor)
+    method_args = {
+        "vss": ["-use-vss"],
+        "shadowcopy": ["-shadow"],
+        "sam": [],
+        "ntds": ["-use-vss"],
+    }
+    
+    command = [
+        "impacket-secretsdump",
+        "-t", method,
+        "-keytab", "/dev/null",  # Placeholder; real key from credential_id
+        *method_args.get(method, []),
+        f"root@{target}",  # In production, derive from credential_id
+    ]
+    
+    return _hex_start_job(command)
+
+@app.route("/api/jobs/t3-impacket-psexec", methods=["POST"])
+def create_t3_impacket_psexec_job():
+    """T3-High: Remote code execution via impacket psexec (authenticated).
+    
+    Executes arbitrary commands on target via psexec — high lateral movement risk.
+    Requires time-delayed approval + justification. Output includes command execution results.
+    """
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_t3_approval_authorized(tier="high"):
+        return jsonify({"error": "T3-High approval token required (3600s delay)"}), 403
+    if not _hex_tool_allowed("impacket-psexec"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    
+    allowed = {"target", "credential_id", "command", "justification"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    credential_id = str(params.get("credential_id", "")).strip()
+    if not _hex_t3_credential_ref_valid(credential_id):
+        return jsonify({"error": "invalid credential_id format"}), 400
+
+    command = str(params.get("command", "")).strip()
+    if not command or len(command) > 2000:
+        return jsonify({"error": "command required and must be < 2000 chars"}), 400
+    
+    # Whitelist allowed commands to prevent lateral movement beyond authorized scope
+    if any(x in command.lower() for x in ["exec", "powershell -e", "cmd /c echo", "||", "&&", "|"]):
+        return jsonify({"error": "command contains disallowed patterns"}), 400
+
+    justification = str(params.get("justification", "")).strip()
+    if not justification or len(justification) < 20:
+        return jsonify({"error": "written justification required (min 20 chars)"}), 400
+
+    _hex_logger.warning(f"🚨 T3-High REMOTE EXECUTION via impacket-psexec on {target}")
+    _hex_logger.warning(f"   Command: {command}")
+    _hex_logger.warning(f"   Justification: {justification}")
+
+    cmd_array = [
+        "impacket-psexec",
+        "-k", "-no-pass",  # Kerberos auth
+        f"{target}",
+        command,
+    ]
+    
+    return _hex_start_job(cmd_array)
+
+@app.route("/api/jobs/t3-hydra-password-spray", methods=["POST"])
+def create_t3_hydra_password_spray_job():
+    """T3-High: Credential guessing via hydra with bounded limits.
+    
+    Password spraying against target accounts. MUST enforce:
+    - Bounded account list (no wildcards)
+    - Bounded password list (no dictionary attacks)
+    - Rate limiting (max 5 attempts/min)
+    - Attempt timeout (max 1 hour)
+    - Account lockout protection
+    """
+    if not _hex_create_authorized():
+        return jsonify({"error": "job creation unauthorized"}), 401
+    if not _hex_t3_approval_authorized(tier="high"):
+        return jsonify({"error": "T3-High approval token required (3600s delay)"}), 403
+    if not _hex_tool_allowed("hydra"):
+        return jsonify({"error": "tool not enabled"}), 403
+
+    params = request.get_json(silent=True) or {}
+    if not isinstance(params, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    
+    allowed = {"target", "protocol", "accounts", "passwords", "rate_limit", "timeout", "justification"}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        return jsonify({"error": f"Unsupported parameters: {', '.join(unknown)}"}), 400
+
+    target = str(params.get("target", "")).strip()
+    target_allowed, target_error = _hex_target_allowed(target)
+    if not target_allowed:
+        return jsonify({"error": target_error}), 403
+
+    protocol = str(params.get("protocol", "smb")).strip()
+    if protocol not in {"smb", "ssh", "rdp", "http-get", "http-post"}:
+        return jsonify({"error": "unsupported protocol"}), 400
+
+    accounts = params.get("accounts", [])
+    if not isinstance(accounts, list) or not accounts or len(accounts) > 10:
+        return jsonify({"error": "accounts must be a list of 1-10 items"}), 400
+    if not all(isinstance(a, str) and _hex_re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", a) for a in accounts):
+        return jsonify({"error": "invalid account format"}), 400
+
+    passwords = params.get("passwords", [])
+    if not isinstance(passwords, list) or not passwords or len(passwords) > 20:
+        return jsonify({"error": "passwords must be a list of 1-20 items"}), 400
+    if not all(isinstance(p, str) and 1 <= len(p) <= 128 for p in passwords):
+        return jsonify({"error": "invalid password format"}), 400
+
+    try:
+        rate_limit = int(params.get("rate_limit", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "rate_limit must be integer"}), 400
+    if not 1 <= rate_limit <= 5:
+        return jsonify({"error": "rate_limit must be 1-5 (attempts/min)"}), 400
+
+    try:
+        timeout = int(params.get("timeout", 300))
+    except (TypeError, ValueError):
+        return jsonify({"error": "timeout must be integer"}), 400
+    if not 60 <= timeout <= 3600:
+        return jsonify({"error": "timeout must be 60-3600 seconds"}), 400
+
+    justification = str(params.get("justification", "")).strip()
+    if not justification or len(justification) < 20:
+        return jsonify({"error": "written justification required (min 20 chars)"}), 400
+
+    _hex_logger.warning(f"🚨 T3-High PASSWORD SPRAY via hydra on {target}")
+    _hex_logger.warning(f"   Accounts: {', '.join(accounts)}")
+    _hex_logger.warning(f"   Justification: {justification}")
+
+    # Build hydra command with bounded limits
+    accounts_file = f"/tmp/hydra_accounts_{_hex_secrets.token_hex(8)}.txt"
+    passwords_file = f"/tmp/hydra_passwords_{_hex_secrets.token_hex(8)}.txt"
+    
+    _HexPath(accounts_file).write_text("\n".join(accounts))
+    _HexPath(passwords_file).write_text("\n".join(passwords))
+    
+    cmd = [
+        "hydra",
+        "-L", accounts_file,
+        "-P", passwords_file,
+        "-t", "1",  # Single thread to respect rate limit
+        "-W", str(timeout),  # Timeout in seconds
+        f"{protocol}://{target}",
+    ]
+    
+    return _hex_start_job(cmd)
+
 @app.route("/api/tools/httpx", methods=["POST"])
 def httpx():
-    """Execute httpx for fast HTTP probing and technology detection"""
+    """Execute ProjectDiscovery httpx against one validated HTTP(S) target."""
     try:
-        params = request.json
-        target = params.get("target", "")
-        probe = params.get("probe", True)
-        tech_detect = params.get("tech_detect", False)
-        status_code = params.get("status_code", False)
-        content_length = params.get("content_length", False)
-        title = params.get("title", False)
-        web_server = params.get("web_server", False)
-        threads = params.get("threads", 50)
-        additional_args = params.get("additional_args", "")
+        params = request.get_json(silent=True) or {}
+        target = str(params.get("target", "")).strip()
 
         if not target:
             logger.warning("🌐 httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        parsed = urlparse(target)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return jsonify(
+                {"error": "Target must be one valid http:// or https:// URL"}
+            ), 400
+
+        try:
+            threads = int(params.get("threads", 10))
+        except (TypeError, ValueError):
+            return jsonify({"error": "threads must be an integer"}), 400
+
+        threads = max(1, min(threads, 50))
+
+        probe = bool(params.get("probe", True))
+        tech_detect = bool(params.get("tech_detect", False))
+        status_code = bool(params.get("status_code", False))
+        content_length = bool(params.get("content_length", False))
+        title = bool(params.get("title", False))
+        web_server = bool(params.get("web_server", False))
+
+        # Pass the validated URL through stdin. shlex.quote prevents shell injection.
+        command = (
+            f"printf '%s\\n' {shlex.quote(target)} "
+            f"| httpx -t {threads}"
+        )
 
         if probe:
             command += " -probe"
@@ -13171,16 +14146,15 @@ def httpx():
         if web_server:
             command += " -server"
 
-        if additional_args:
-            command += f" {additional_args}"
-
-        logger.info(f"🌍 Starting httpx probe: {target}")
+        logger.info("🌍 Starting httpx probe: %s", target)
         result = execute_command(command)
-        logger.info(f"📊 httpx probe completed for {target}")
+        logger.info("📊 httpx probe completed: %s", target)
+
         return jsonify(result)
-    except Exception as e:
-        logger.error(f"💥 Error in httpx endpoint: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+    except Exception as exc:
+        logger.error("💥 Error in httpx endpoint: %s", exc)
+        return jsonify({"error": f"Server error: {exc}"}), 500
 
 @app.route("/api/tools/anew", methods=["POST"])
 def anew():

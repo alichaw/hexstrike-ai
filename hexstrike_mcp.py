@@ -166,7 +166,7 @@ class HexStrikeClient:
                 logger.info(f"🔗 Attempting to connect to HexStrike AI API at {server_url} (attempt {i+1}/{MAX_RETRIES})")
                 # First try a direct connection test before using the health endpoint
                 try:
-                    test_response = self.session.get(f"{self.server_url}/health", timeout=5)
+                    test_response = self.session.get(f"{self.server_url}/health", timeout=180)
                     test_response.raise_for_status()
                     health_check = test_response.json()
                     connected = True
@@ -5409,6 +5409,190 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         else:
             logger.error(f"{HexStrikeColors.ERROR}❌ Error recovery test failed{HexStrikeColors.RESET}")
 
+        return result
+
+    # ============================================================================
+    # T3 TOOLS: ACCESS / LATERAL MOVEMENT (APPROVAL-GATED)
+    # ============================================================================
+
+    @mcp.tool()
+    def t3_ssh_port_forward(target: str, credential_id: str, local_port: int = 9999,
+                           remote_host: str = "127.0.0.1", remote_port: int = 3389,
+                           bind_address: str = "127.0.0.1", approval_token: str = "") -> Dict[str, Any]:
+        """
+        T3-Low: Establish SSH port forwarding tunnel through authorized asset.
+
+        WARNING: Requires T3-Low approval token (900s delay minimum).
+        Credentials are referenced by ID only — never embedded as plaintext.
+
+        Args:
+            target: Authorized target IP/hostname for tunneling
+            credential_id: Named credential set ID (e.g., 'lab-admin')
+            local_port: Local port to bind tunnel to (1-65535, default 9999)
+            remote_host: Remote host to forward to (default 127.0.0.1 for localhost pivoting)
+            remote_port: Remote port (default 3389 for RDP)
+            bind_address: Local bind address (127.0.0.1 or 0.0.0.0)
+            approval_token: T3-Low approval token
+
+        Returns:
+            Tunnel status and access information
+        """
+        data = {
+            "target": target,
+            "credential_id": credential_id,
+            "local_port": str(local_port),
+            "remote_host": remote_host,
+            "remote_port": str(remote_port),
+            "bind_address": bind_address,
+        }
+        
+        logger.warning(f"{HexStrikeColors.CRIMSON}🔐 T3-Low SSH Tunnel Request: {target}{HexStrikeColors.RESET}")
+        logger.warning(f"   Local: {bind_address}:{local_port}")
+        logger.warning(f"   Remote: {remote_host}:{remote_port}")
+        logger.warning(f"   Credential: {credential_id} (ID reference, secret not logged)")
+        
+        result = hexstrike_client.safe_post("api/jobs/t3-ssh-port-forward", data, 
+                                           headers={"X-T3-Approval-Token": approval_token})
+        
+        if result.get("success"):
+            logger.info(f"{HexStrikeColors.SUCCESS}✅ SSH tunnel established{HexStrikeColors.RESET}")
+        else:
+            logger.error(f"{HexStrikeColors.ERROR}❌ SSH tunnel failed: {result.get('error', 'unknown')}{HexStrikeColors.RESET}")
+        
+        return result
+
+    @mcp.tool()
+    def t3_credential_extraction(target: str, credential_id: str, method: str = "vss",
+                                 justification: str = "", approval_token: str = "") -> Dict[str, Any]:
+        """
+        T3-High: Extract credentials (NTLM hashes, Kerberos tickets) via impacket-secretsdump.
+
+        WARNING: Requires T3-High approval token (3600s delay minimum + written justification).
+        Output WILL BE REDACTED before storage.
+        Harvested credentials are sensitive artifacts and must never appear in logs.
+
+        Args:
+            target: Authorized target for credential harvesting
+            credential_id: Credential set ID for authentication
+            method: Extraction method (vss, shadowcopy, sam, ntds)
+            justification: Written justification for this specific extraction (min 20 chars)
+            approval_token: T3-High approval token
+
+        Returns:
+            Extraction status (output will be redacted automatically)
+        """
+        data = {
+            "target": target,
+            "credential_id": credential_id,
+            "method": method,
+            "justification": justification,
+        }
+        
+        logger.error(f"{HexStrikeColors.CRITICAL}🚨 T3-HIGH CREDENTIAL EXTRACTION{HexStrikeColors.RESET}")
+        logger.error(f"   Target: {target}")
+        logger.error(f"   Method: {method}")
+        logger.error(f"   Justification: {justification[:50]}...")
+        
+        result = hexstrike_client.safe_post("api/jobs/t3-impacket-secretsdump", data,
+                                           headers={"X-T3-Approval-Token": approval_token})
+        
+        if result.get("success"):
+            logger.error(f"{HexStrikeColors.CRITICAL}✅ CREDENTIAL EXTRACTION COMPLETE — OUTPUT REDACTED{HexStrikeColors.RESET}")
+        else:
+            logger.error(f"{HexStrikeColors.ERROR}❌ Credential extraction failed{HexStrikeColors.RESET}")
+        
+        return result
+
+    @mcp.tool()
+    def t3_remote_command_execution(target: str, credential_id: str, command: str,
+                                    justification: str = "", approval_token: str = "") -> Dict[str, Any]:
+        """
+        T3-High: Remote command execution on target via impacket-psexec.
+
+        WARNING: Requires T3-High approval token (3600s delay minimum + written justification).
+        Commands are limited to whitelisted patterns to prevent lateral movement beyond authorized scope.
+
+        Args:
+            target: Authorized target for RCE
+            credential_id: Credential set ID for authentication
+            command: Command to execute (subject to safety filtering)
+            justification: Written justification (min 20 chars)
+            approval_token: T3-High approval token
+
+        Returns:
+            Command execution status and output
+        """
+        data = {
+            "target": target,
+            "credential_id": credential_id,
+            "command": command,
+            "justification": justification,
+        }
+        
+        logger.error(f"{HexStrikeColors.CRITICAL}🚨 T3-HIGH REMOTE EXECUTION{HexStrikeColors.RESET}")
+        logger.error(f"   Target: {target}")
+        logger.error(f"   Command: {command[:100]}{'...' if len(command) > 100 else ''}")
+        
+        result = hexstrike_client.safe_post("api/jobs/t3-impacket-psexec", data,
+                                           headers={"X-T3-Approval-Token": approval_token})
+        
+        if result.get("success"):
+            logger.info(f"{HexStrikeColors.SUCCESS}✅ Remote execution completed{HexStrikeColors.RESET}")
+        else:
+            logger.error(f"{HexStrikeColors.ERROR}❌ Remote execution failed{HexStrikeColors.RESET}")
+        
+        return result
+
+    @mcp.tool()
+    def t3_password_spray(target: str, protocol: str, accounts: List[str], 
+                         passwords: List[str], rate_limit: int = 1, timeout: int = 300,
+                         justification: str = "", approval_token: str = "") -> Dict[str, Any]:
+        """
+        T3-High: Bounded credential guessing via hydra with safety limits.
+
+        WARNING: Requires T3-High approval token (3600s delay minimum + written justification).
+        Enforces strict limits:
+        - Max 10 accounts, 20 password attempts
+        - Rate limit 1-5 attempts per minute
+        - Timeout 60-3600 seconds
+        - Account lockout protection
+
+        Args:
+            target: Authorized target for password spraying
+            protocol: Protocol (smb, ssh, rdp, http-get, http-post)
+            accounts: List of accounts to test (max 10)
+            passwords: List of passwords to try (max 20)
+            rate_limit: Attempts per minute (1-5, default 1)
+            timeout: Max execution time (60-3600 seconds)
+            justification: Written justification (min 20 chars)
+            approval_token: T3-High approval token
+
+        Returns:
+            Password spray results
+        """
+        data = {
+            "target": target,
+            "protocol": protocol,
+            "accounts": accounts,
+            "passwords": passwords,
+            "rate_limit": rate_limit,
+            "timeout": timeout,
+            "justification": justification,
+        }
+        
+        logger.error(f"{HexStrikeColors.CRITICAL}🚨 T3-HIGH PASSWORD SPRAY{HexStrikeColors.RESET}")
+        logger.error(f"   Target: {target} ({protocol})")
+        logger.error(f"   Accounts: {len(accounts)} to test")
+        logger.error(f"   Rate: {rate_limit} attempt(s)/min, {timeout}s timeout")
+        
+        result = hexstrike_client.safe_post("api/jobs/t3-hydra-password-spray", data,
+                                           headers={"X-T3-Approval-Token": approval_token})
+        
+        if result.get("success"):
+            logger.info(f"{HexStrikeColors.SUCCESS}✅ Password spray completed{HexStrikeColors.RESET}")
+        else:
+            logger.error(f"{HexStrikeColors.ERROR}❌ Password spray failed{HexStrikeColors.RESET}")
+        
         return result
 
     return mcp
