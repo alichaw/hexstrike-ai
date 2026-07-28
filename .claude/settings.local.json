@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"\\\\\\\\wsl.localhost\\\\kali-linux\\\\home\\\\kali\\\\hexstrike-ai\")"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+# Isolation proof — labnet (2026-07-13T02:33:22Z)
+## A0 network is internal
+Internal=true  Subnet=172.18.0.0/16
+## A1 egress to 1.1.1.1:443 (expect BLOCKED)
+EGRESS: BLOCKED (GOOD)
+## A2 reach target juiceshop:3000 (expect REACHED)
+TARGET: REACHED (GOOD)
