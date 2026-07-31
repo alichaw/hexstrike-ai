@@ -13823,6 +13823,7 @@ def create_t3_ssh_port_forward_job():
     Establishes a tunnel to the target asset for further enumeration.
     Credentials are NEVER embedded — only credential_id is sent.
     """
+    return jsonify({"error": "legacy T3 endpoint disabled"}), 410
     if not _hex_create_authorized():
         return jsonify({"error": "job creation unauthorized"}), 401
     if not _hex_t3_approval_authorized(tier="low"):
@@ -13890,6 +13891,7 @@ def create_t3_impacket_secretsdump_job():
     Requires time-delayed approval token + written justification.
     OUTPUT MUST BE REDACTED before storage.
     """
+    return jsonify({"error": "legacy T3 endpoint disabled"}), 410
     if not _hex_create_authorized():
         return jsonify({"error": "job creation unauthorized"}), 401
     if not _hex_t3_approval_authorized(tier="high"):
@@ -13953,6 +13955,7 @@ def create_t3_impacket_psexec_job():
     Executes arbitrary commands on target via psexec — high lateral movement risk.
     Requires time-delayed approval + justification. Output includes command execution results.
     """
+    return jsonify({"error": "legacy T3 endpoint disabled"}), 410
     if not _hex_create_authorized():
         return jsonify({"error": "job creation unauthorized"}), 401
     if not _hex_t3_approval_authorized(tier="high"):
@@ -14014,6 +14017,7 @@ def create_t3_hydra_password_spray_job():
     - Attempt timeout (max 1 hour)
     - Account lockout protection
     """
+    return jsonify({"error": "legacy T3 endpoint disabled"}), 410
     if not _hex_create_authorized():
         return jsonify({"error": "job creation unauthorized"}), 401
     if not _hex_t3_approval_authorized(tier="high"):
@@ -18227,6 +18231,14 @@ def get_alternative_tools():
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()
 
+# The bounded T3-A route is registered only when a verifier secret is configured.
+# It is independent of the legacy generic/T3 endpoints and fails closed otherwise.
+from hexstrike_t3a import register_t3a_routes
+from hexstrike_t3b import register_t3b_routes
+
+register_t3a_routes(app)
+register_t3b_routes(app)
+
 if __name__ == "__main__":
     # Display the beautiful new banner
     print(BANNER)
@@ -18260,4 +18272,7 @@ if __name__ == "__main__":
         if line.strip():
             logger.info(line)
 
-    app.run(host="0.0.0.0", port=API_PORT, debug=DEBUG_MODE)
+    api_host = os.environ.get("HEXSTRIKE_HOST", "127.0.0.1")
+    if api_host != "127.0.0.1":
+        raise SystemExit("HEXSTRIKE_HOST must be 127.0.0.1")
+    app.run(host=api_host, port=API_PORT, debug=DEBUG_MODE)
