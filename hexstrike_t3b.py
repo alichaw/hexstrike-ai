@@ -360,8 +360,15 @@ class T3BService(T3AService):
         return results
 
 
-def register_t3b_routes(app, service: T3BService | None = None) -> None:
+def register_t3b_routes(
+    app,
+    service: T3BService | None = None,
+    *,
+    assurance_profile: str | None = None,
+) -> None:
     if service is None:
+        if assurance_profile != "hardened":
+            return
         secret = os.environ.get("HEXSTRIKE_EXECUTION_PERMIT_SECRET", "")
         if not secret:
             return

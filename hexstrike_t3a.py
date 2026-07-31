@@ -52,8 +52,9 @@ class T3AService:
         kill_switch_path: Path | None = None,
         runner=None,
         clock=time.time,
+        allow_unsigned_poc: bool = False,
     ):
-        if len(permit_secret) < 32:
+        if len(permit_secret) < 32 and not allow_unsigned_poc:
             raise ValueError("permit_verifier_secret_invalid")
         self.secret = permit_secret
         self.target_matrix_path = target_matrix_path
@@ -313,8 +314,15 @@ class T3AService:
         return results
 
 
-def register_t3a_routes(app, service: T3AService | None = None) -> None:
+def register_t3a_routes(
+    app,
+    service: T3AService | None = None,
+    *,
+    assurance_profile: str | None = None,
+) -> None:
     if service is None:
+        if assurance_profile != "hardened":
+            return
         secret = os.environ.get("HEXSTRIKE_EXECUTION_PERMIT_SECRET", "")
         if not secret:
             return
