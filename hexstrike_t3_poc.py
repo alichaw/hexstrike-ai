@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import grp
 import ipaddress
 import json
 import logging
 import os
 import re
-import stat
 import time
 from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from hexstrike_t3_config import load_protected_json
 from hexstrike_t3_authorization import (
     consume_authorization_id,
     validate_authorization_id,
@@ -39,17 +38,7 @@ _LOGGER = logging.getLogger("hexstrike.t3.poc")
 
 
 def _protected_json(path: Path) -> dict[str, Any]:
-    info = path.stat()
-    if (
-        info.st_uid != 0
-        or grp.getgrgid(info.st_gid).gr_name != "hexstrike"
-        or stat.S_IMODE(info.st_mode) != 0o640
-    ):
-        raise ValueError("poc_configuration_not_protected")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError("poc_configuration_invalid")
-    return value
+    return load_protected_json(path)
 
 
 class T3PocService:
@@ -178,10 +167,13 @@ def register_t3_poc_routes(
     *,
     assurance_profile: str | None = None,
 ) -> None:
-    if service is None:
-        if assurance_profile != PROFILE:
-            return
-        service = T3PocService(
+    if service is None and assurance_profile != PROFILE:
+        return
+
+    def resolve_service() -> T3PocService:
+        if service is not None:
+            return service
+        return T3PocService(
             reachability_path=Path(
                 os.environ.get(
                     "HEXSTRIKE_T3_REACHABILITY_CONFIG",
@@ -195,6 +187,7 @@ def register_t3_poc_routes(
                 )
             ),
         )
+
     blueprint = Blueprint("hexstrike_t3_poc", __name__)
 
     def valid_body(action: str) -> tuple[dict[str, Any] | None, Any | None]:
@@ -217,7 +210,9 @@ def register_t3_poc_routes(
         if error:
             return error
         try:
-            result = service.execute_t3a(body["authorization_id"])
+            if service is None:
+                validate_authorization_id(body["authorization_id"], "T3-A")
+            result = resolve_service().execute_t3a(body["authorization_id"])
             return jsonify(result), 200 if result["status"] == "completed" else 422
         except ValueError as exc:
             code = str(exc)
@@ -234,7 +229,9 @@ def register_t3_poc_routes(
         if error:
             return error
         try:
-            result = service.execute_t3b(body["authorization_id"])
+            if service is None:
+                validate_authorization_id(body["authorization_id"], "T3-B")
+            result = resolve_service().execute_t3b(body["authorization_id"])
             return jsonify(result), 200 if result["status"] == "verified" else 422
         except ValueError as exc:
             code = str(exc)

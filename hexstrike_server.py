@@ -18234,20 +18234,10 @@ BANNER = ModernVisualEngine.create_banner()
 # The explicit protected assurance profile selects either signed hardened routes
 # or unsigned PoC routes. Missing/unknown profiles abort startup; neither route
 # family falls back to the legacy generic/T3 endpoints.
-from hexstrike_t3a import register_t3a_routes
-from hexstrike_t3b import register_t3b_routes
-from hexstrike_t3c import register_t3c_routes
-from hexstrike_t3_poc import register_t3_poc_routes
 from hexstrike_t3_profile import assurance_audit_record, resolve_assurance_profile
-from hexstrike_t3_reachability import register_t3_reachability_routes
 
 T3_ASSURANCE_PROFILE = resolve_assurance_profile()
 logger.info("T3 assurance selection: %s", assurance_audit_record(T3_ASSURANCE_PROFILE))
-register_t3a_routes(app, assurance_profile=T3_ASSURANCE_PROFILE)
-register_t3b_routes(app, assurance_profile=T3_ASSURANCE_PROFILE)
-register_t3c_routes(app, assurance_profile=T3_ASSURANCE_PROFILE)
-register_t3_reachability_routes(app)
-register_t3_poc_routes(app, assurance_profile=T3_ASSURANCE_PROFILE)
 
 if __name__ == "__main__":
     # Display the beautiful new banner

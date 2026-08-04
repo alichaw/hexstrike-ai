@@ -1,0 +1,6 @@
+{
+  "assurance_profile": "poc",
+  "asset_id": "asset:winsrv2025-01",
+  "target_binding": "<SHA256_ASSET_TARGET_PORT_BINDING>",
+  "pinned_host_key": "<PINNED_ED25519_HOST_KEY>"
+}

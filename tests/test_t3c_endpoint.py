@@ -18,6 +18,7 @@ from hexstrike_t3c import (  # noqa: E402
     T3CService,
     register_t3c_routes,
 )
+from hexstrike_t3_identity import IDENTITY_AGENT_PATH  # noqa: E402
 
 NOW = 1_800_000_000
 
@@ -89,7 +90,7 @@ def config(tmp_path, **updates):
         "asset_id": "asset:winsrv2025-01",
         "target": "192.0.2.25",
         "credential_ref": "credential:fixture",
-        "identity_agent": "/fixture/agent.sock",
+        "identity_agent": IDENTITY_AGENT_PATH,
         "username": "fixture-user",
         "pinned_host_key_file": "/fixture/known-hosts",
         "marker_path": MARKER_PATH,
@@ -103,12 +104,22 @@ def config(tmp_path, **updates):
     value.update(updates)
     path = tmp_path / "t3c.json"
     path.write_text(json.dumps(value))
+    (tmp_path / "reachability.json").write_text(
+        json.dumps(
+            {
+                "asset_id": "asset:winsrv2025-01",
+                "target": value["target"],
+                "port": 22,
+            }
+        )
+    )
     return path
 
 
 def client(tmp_path, **updates):
     service = T3CService(
         config(tmp_path, **updates),
+        reachability_path=tmp_path / "reachability.json",
         connector_factory=RecordingConnector,
         clock=lambda: NOW,
     )
@@ -202,6 +213,7 @@ def test_missing_config_listener_starts_but_action_fails_closed(tmp_path):
     app = Flask(__name__)
     service = T3CService(
         tmp_path / "missing.json",
+        reachability_path=tmp_path / "reachability.json",
         connector_factory=RecordingConnector,
         clock=lambda: NOW,
     )
@@ -209,6 +221,18 @@ def test_missing_config_listener_starts_but_action_fails_closed(tmp_path):
     assert (
         app.test_client().post("/api/v1/t3c/executions", json=body()).status_code == 403
     )
+    assert RecordingConnector.calls == []
+
+
+def test_nonregistered_target_is_rejected_before_connector(tmp_path):
+    selected, service = client(tmp_path)
+    reachability = tmp_path / "reachability.json"
+    value = json.loads(reachability.read_text())
+    value["target"] = "198.51.100.8"
+    reachability.write_text(json.dumps(value))
+    response = selected.post("/api/v1/t3c/executions", json=body())
+    assert response.status_code == 403
+    assert not service.connector_invoked
     assert RecordingConnector.calls == []
 
 

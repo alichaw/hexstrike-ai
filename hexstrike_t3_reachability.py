@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-import grp
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import socket
-import stat
 from pathlib import Path
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+
+from hexstrike_t3_config import load_protected_json
 
 ACTION_ID = "t3a.ssh22_reachability.v1"
 ASSET_ID = "asset:winsrv2025-01"
 PORT = 22
 SCHEMA = "hexstrike-t3-ssh-reachability/v1"
 TIMEOUT_SECONDS = 5
+_LOGGER = logging.getLogger("hexstrike.t3.reachability")
 
 
 def target_binding(asset_id: str, target: str, port: int) -> str:
@@ -40,15 +42,11 @@ class T3SshReachabilityService:
         self.connector = connector or self._connect
 
     def _config(self) -> dict[str, Any]:
-        if self.require_protected_config:
-            info = self.config_path.stat()
-            if (
-                info.st_uid != 0
-                or grp.getgrgid(info.st_gid).gr_name != "hexstrike"
-                or stat.S_IMODE(info.st_mode) != 0o640
-            ):
-                raise ValueError("reachability_configuration_not_protected")
-        value = json.loads(self.config_path.read_text(encoding="utf-8"))
+        value = (
+            load_protected_json(self.config_path)
+            if self.require_protected_config
+            else json.loads(self.config_path.read_text(encoding="utf-8"))
+        )
         if (
             not isinstance(value, dict)
             or set(value) != {"asset_id", "target", "port"}
@@ -111,7 +109,13 @@ def register_t3_reachability_routes(
             ):
                 raise ValueError("request_invalid")
             return jsonify(selected.execute(body["asset_id"])), 200
+        except ValueError as exc:
+            _LOGGER.warning("event=t3_reachability_denied error_code=%s", str(exc))
+            return jsonify({"error": "t3_ssh_reachability_denied"}), 403
         except Exception:
+            _LOGGER.warning(
+                "event=t3_reachability_denied error_code=reachability_internal_error"
+            )
             return jsonify({"error": "t3_ssh_reachability_denied"}), 403
 
     app.register_blueprint(blueprint)

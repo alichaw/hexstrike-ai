@@ -20,6 +20,8 @@ from hexstrike_t3_authorization import (
     consume_authorization_id,
     validate_authorization_id,
 )
+from hexstrike_t3_identity import IDENTITY_AGENT_PATH
+from hexstrike_t3_config import load_protected_json
 
 ACTION_ID = "t3c.controlled_impact_proof.v1"
 SCHEMA = "hexstrike-t3c-result/v2"
@@ -114,6 +116,7 @@ class T3CService:
     def __init__(
         self,
         config_path: str | Path | None = None,
+        reachability_path: str | Path | None = None,
         connector_factory=None,
         nonce_db_path: str | Path | None = None,
         clock=time.time,
@@ -121,6 +124,13 @@ class T3CService:
         selected_path = config_path or os.environ.get("HEXSTRIKE_T3C_CONFIG", "")
         self.require_protected_config = config_path is None
         self.config_path = Path(selected_path)
+        self.reachability_path = Path(
+            reachability_path
+            or os.environ.get(
+                "HEXSTRIKE_T3_REACHABILITY_CONFIG",
+                "/etc/hexstrike/t3-reachability.json",
+            )
+        )
         self.nonce_db_path = Path(
             nonce_db_path
             or (
@@ -172,8 +182,28 @@ class T3CService:
             raise ValueError("scenario_configuration_invalid")
         if value.get("asset_id") != "asset:winsrv2025-01":
             raise ValueError("scenario_asset_unapproved")
+        if value.get("identity_agent") != IDENTITY_AGENT_PATH:
+            raise ValueError("scenario_identity_agent_invalid")
         address = ipaddress.ip_address(value["target"])
-        if not address.is_private or address.is_loopback:
+        reachability = (
+            load_protected_json(self.reachability_path)
+            if self.require_protected_config
+            else json.loads(self.reachability_path.read_text(encoding="utf-8"))
+        )
+        if (
+            set(reachability) != {"asset_id", "target", "port"}
+            or reachability.get("asset_id") != value.get("asset_id")
+            or reachability.get("target") != value.get("target")
+            or reachability.get("port") != 22
+        ):
+            raise ValueError("scenario_registered_target_binding_invalid")
+        if (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_reserved
+        ):
             raise ValueError("scenario_target_invalid")
         if (
             value.get("marker_path") != MARKER_PATH

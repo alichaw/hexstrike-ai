@@ -211,3 +211,17 @@ def test_poc_routes_are_absent_without_explicit_profile(monkeypatch):
         .status_code
         == 404
     )
+
+
+def test_poc_route_registration_does_not_eagerly_load_action_configuration(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hexstrike_t3_poc.T3PocService",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("eager load")),
+    )
+    app = Flask(__name__)
+    register_t3_poc_routes(app, assurance_profile="poc")
+    assert any(
+        rule.rule == "/api/v1/t3a/poc-executions" for rule in app.url_map.iter_rules()
+    )

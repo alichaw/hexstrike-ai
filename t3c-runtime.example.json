@@ -4,7 +4,7 @@
   "asset_id": "asset:winsrv2025-01",
   "target": "192.0.2.25",
   "credential_ref": "<PROTECTED_CREDENTIAL_REFERENCE>",
-  "identity_agent": "<PROTECTED_IDENTITY_AGENT_REFERENCE>",
+  "identity_agent": "/run/hexstrike-t3-ssh-agent/agent.sock",
   "username": "<APPROVED_LOW_PRIVILEGE_ACCOUNT>",
   "pinned_host_key_file": "<PROTECTED_PINNED_HOST_KEY_FILE>",
   "marker_path": "C:\\ProgramData\\HexStrike\\t3c-synthetic-marker.txt",

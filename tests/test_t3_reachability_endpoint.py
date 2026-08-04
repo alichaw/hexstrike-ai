@@ -44,6 +44,25 @@ def test_reachable_result_is_fixed_and_structured(tmp_path):
     assert len(response.get_json()["target_binding"]) == 64
 
 
+def test_unreachable_result_is_explicit_and_does_not_resolve_credentials(tmp_path):
+    calls = []
+
+    def connector(target, port):
+        calls.append((target, port))
+        return "unreachable"
+
+    selected = client(tmp_path, connector)
+    response = selected.post(
+        "/api/v1/t3/ssh-reachability",
+        json={"action_id": ACTION_ID, "asset_id": "asset:winsrv2025-01"},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["state"] == "unreachable"
+    assert len(calls) == 1
+    assert "credential" not in response.get_json()
+    assert "username" not in response.get_json()
+
+
 def test_caller_cannot_supply_target_port_or_command(tmp_path):
     selected = client(tmp_path, lambda target, port: "reachable")
     for field in ("target", "port", "command"):
@@ -122,5 +141,5 @@ def test_default_protected_config_requires_root_hexstrike_mode_0640(tmp_path):
         config, connector=lambda target, port: "reachable"
     )
     service.require_protected_config = True
-    with pytest.raises(ValueError, match="not_protected"):
+    with pytest.raises(ValueError, match="unsafe_metadata"):
         service._config()

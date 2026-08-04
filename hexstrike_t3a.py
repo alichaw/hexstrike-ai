@@ -19,6 +19,8 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from hexstrike_t3_identity import IDENTITY_AGENT_PATH
+
 PERMIT_SCHEMA = "hexstrike-t3a-permit/v1"
 RESULT_SCHEMA = "hexstrike-t3a-result/v1"
 OPERATION_ID = "windows.ssh.identity.v1"
@@ -186,7 +188,7 @@ class T3AService:
             r"[A-Za-z0-9._@-]{1,128}", username
         ):
             raise ValueError("credential_configuration_invalid")
-        if not isinstance(agent, str) or not agent.startswith("/run/"):
+        if agent != IDENTITY_AGENT_PATH:
             raise ValueError("credential_configuration_invalid")
         return {"username": username, "identity_agent": agent}
 
